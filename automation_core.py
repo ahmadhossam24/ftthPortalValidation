@@ -1,6 +1,7 @@
 import requests
 import json
 import re
+import base64
 import tkinter as tk
 from tkinter import filedialog
 import os
@@ -14,13 +15,14 @@ import random
 import urllib3
 urllib3.disable_warnings()
 
-BASE   = "https://10.20.129.197/ftthPortalBE"
-SEARCH = BASE + "/dataSearchAndViewServiceNumberData/searchingWOAndVC4"
+BASE    = "https://10.20.129.197/ftthPortalBE"
+SEARCH  = BASE + "/dataSearchAndViewServiceNumberData/searchingWOAndVC4"
+REFRESH = BASE + "/refresh"
 
 PREFIXES = {"2", "3", "13", "40", "48", "55", "62", "64", "46", "66", "68", "69",
             "50", "45", "57", "47", "92", "65", "84", "82", "86", "88", "93", "95", "96", "97"}
 
-# ------------------------------------------------------------------ NEW: parse pasted cURL
+# ------------------------------------------------------------------ parse pasted cURL
 def parse_curl(paste: str):
     """Extracts (bearer, cookie_dict) from a full 'Copy as cURL' paste, or a bare token."""
     paste = paste.strip()
@@ -58,6 +60,41 @@ def build_session(bearer, cookies):
     })
     return s
 
+# ------------------------------------------------------------------ token refresh
+def jwt_exp(token: str):
+    """Return 'exp' timestamp from the JWT payload (no verification)."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+    except Exception:
+        return None
+
+def refresh_token(session, log_queue=None):
+    """
+    Call /refresh with the current session (current bearer + cookies).
+    Extract new token from response JSON key 'value' ("Bearer eyJ..."),
+    update the session Authorization header IN PLACE.
+    Returns new token string. Raises PermissionError if refresh fails.
+    """
+    r = session.get(REFRESH, timeout=20)
+    if r.status_code != 200:
+        raise PermissionError(f"refresh failed: HTTP {r.status_code}")
+    try:
+        new_token = r.json().get("value", "")
+    except ValueError:
+        raise PermissionError("refresh response was not JSON")
+    if new_token.lower().startswith("bearer "):
+        new_token = new_token[7:]
+    if not new_token or new_token.count(".") != 2:
+        raise PermissionError("refresh response had no valid token")
+    session.headers["Authorization"] = "Bearer " + new_token
+    if log_queue:
+        exp = jwt_exp(new_token)
+        mins = int(exp - time.time()) if exp else "?"
+        log_queue.put(f"تم تجديد الجلسة (صالحة ~{mins} دقيقة)")
+    return new_token
+
 def split_number(full_number):
     full_number = full_number.strip()
     for prefix in sorted(PREFIXES, key=len, reverse=True):
@@ -65,7 +102,7 @@ def split_number(full_number):
             return "0" + prefix, full_number[len(prefix):]
     return "", full_number
 
-# ------------------------------------------------------------------ excel writer (unchanged logic)
+# ------------------------------------------------------------------ excel writer
 def excel_writer_listener(queue, log_queue, results_file, draft_file):
     headers = ["FULLNUMBER", "INFORMATION"]
     for f in [results_file, draft_file]:
@@ -120,18 +157,40 @@ def worker_task(session, index, row_data, queue, stop_flag, log_queue):
 
     time.sleep(random.uniform(0.1, 0.9))
 
-    try:
-        r = session.get(SEARCH, params={"cityCode": landline_code,
-                                        "serviceNumber": landline_number}, timeout=20)
-    except requests.RequestException as e:
-        queue.put((index, [full_number, f"error: {e}"]))
-        return
+    r = None
+    data = None
 
-    if r.status_code in (401, 403) or "اسم المستخدم" in r.text:
-        log_queue.put(f"تم تسجيل الخروج من الحساب اثناء معالجة السطر {index+1}")
+    # ---- attempt loop: 1st try, and one retry after refresh if 401/403 ----
+    for attempt in range(2):
+        if stop_flag.is_set():
+            return
+        try:
+            r = session.get(SEARCH, params={"cityCode": landline_code,
+                                            "serviceNumber": landline_number}, timeout=20)
+        except requests.RequestException as e:
+            queue.put((index, [full_number, f"error: {e}"]))
+            return
+
+        if r.status_code in (401, 403) or "اسم المستخدم" in r.text:
+            if attempt == 0:
+                # token expired -> refresh and retry THIS SAME number once
+                try:
+                    refresh_token(session, log_queue)
+                    continue          # retry the same request with the new token
+                except (PermissionError, requests.RequestException) as e:
+                    log_queue.put(f"فشل تجديد الجلسة: {e}")
+                    break             # fall through to the "session dead" handling below
+            break                     # second 401 in a row -> session really dead
+
+        break                         # got a usable response (any status != 401/403)
+
+    # ---- session dead -> notify and stop the whole run ----
+    if r is not None and (r.status_code in (401, 403) or "اسم المستخدم" in r.text):
+        log_queue.put(f"انتهت الجلسة نهائياً عند السطر {index+1}")
         log_queue.put(f"برجاء بدء العملية مرة اخرى بداية من السطر {index+1}")
         stop_flag.set()
         return
+
     if r.status_code != 200:
         queue.put((index, [full_number, f"error HTTP {r.status_code}: {r.text[:100]}"]))
         return
@@ -141,6 +200,7 @@ def worker_task(session, index, row_data, queue, stop_flag, log_queue):
     except ValueError:
         queue.put((index, [full_number, f"error: غير JSON — {r.text[:100]}"]))
         return
+
     if data.get("code") == 1:
         queue.put((index, [full_number, "Orange"]))
     elif data.get("code") == 4:
@@ -166,7 +226,7 @@ def run_bot(curl_paste, start_line, excel_file, log_queue, stop_flag):
             log_queue.put("تم انهاء العملية")
             stop_flag.set()
             return
-        # NEW: parse the pasted cURL once, build the session ONCE for the whole run
+
         try:
             bearer, cookies = parse_curl(curl_paste)
         except ValueError as e:
@@ -174,7 +234,18 @@ def run_bot(curl_paste, start_line, excel_file, log_queue, stop_flag):
             log_queue.put("تم انهاء العملية")
             stop_flag.set()
             return
+
         session = build_session(bearer, cookies)
+
+        # sanity check before starting: try one refresh now (also confirms /refresh works)
+        try:
+            refresh_token(session, log_queue)
+        except Exception as e:
+            log_queue.put(f"فشل تجديد الجلسة عند البداية: {e} — تأكد من صحة الـ curl")
+            log_queue.put("تم انهاء العملية")
+            stop_flag.set()
+            return
+
         log_queue.put("تم تجهيز الجلسة — جاري معالجة البيانات")
 
         start_time = time.time()
@@ -186,6 +257,7 @@ def run_bot(curl_paste, start_line, excel_file, log_queue, stop_flag):
             watcher = mp.Process(target=excel_writer_listener,
                                  args=(results_queue, log_queue, results_file, draft_file))
             watcher.start()
+
             with mp.Pool(1) as pool:
                 pool.starmap(worker_task, [
                     (session, t[0], t[1], results_queue, stop_flag, log_queue)
@@ -194,6 +266,7 @@ def run_bot(curl_paste, start_line, excel_file, log_queue, stop_flag):
 
             results_queue.put("STOP")
             watcher.join()
+
         log_queue.put("تم انهاء العملية")
         elapsed = (time.time() - start_time) / 60
         log_queue.put(f"وقت المعالجة {elapsed:.2f} دقيقة")
