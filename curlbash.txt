@@ -1,0 +1,34 @@
+curl --url 'https://10.20.129.197/ftthPortalBE/dataSearchAndViewServiceNumberData/searchingWOAndVC4?cityCode=02&serviceNumber=23445756' \
+  -H 'Accept: application/json, text/plain, */*' \
+  -H 'Accept-Language: en-US,en;q=0.9' \
+  -H 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJtb2hhbWVkLmF6YWJAb3JhbmdlLmNvbSIsIlJvbGVzIjoiW09yYW5nZSBGVFRILVhEU0wgTWl4ZWQgUm9sZSBNb25pdG9yXSIsImV4cCI6MTc5MjQ4NDU5OCwiaWF0IjoxNzkyNDgzNTE4fQ.xO67mDNS37AmSnuULrYOSkKZ9zdW5hUcjI4aR8DNCQkCTGJ9JGQY4ax2guJCSpQILiOGD-zdQNXHXAZs2wuAaw' \
+  -H 'Connection: keep-alive' \
+  -b 'JSESSIONID=CF142789A987460B06445334DE1A1084; TS014d031a=010aa23b1d3dd1e366b0ca9c3db94c4f142fed1937403f22e2d32b167b423d3bbf6e078e9c30c8869adf25acaee017c29abe366f36eab3c305f8a9e0c64533356b6e917864a73343bf1d192c3b36193c9ba7ffb61972b759ee6be09b1a696c9ade94d57582; dtCookie=v_4_srv_52_sn_26BB0306B6A6232EDB12FFF276F4DBDC_perc_100000_ol_0_mul_1_app-3Aea7c4b59f27d43eb_1; BIGipServerFTTH_Portal_extenal_FE_Pool_443=3280016394.47873.0000; rxVisitor=1792479617070T828IICTOH2G2EMCPRB0L1IGLBKIR1OO; dtSa=-; TS0155b883=010aa23b1d13b04aabfa7bc8a3d68ec573c077cbde7bec5da446ea77dccd589cdc5620a2a8778974f875fa65bb0cb2ac419d61d06509809f6ec7ba1d68d32cbcfc07688489c44d044ed068a0e33df56849ffce48d4; rxvt=1792485137943|1792481474087; dtPC=52$283337552_200h-vVEMWVEHAECFWUBLCNPKSARSKFFGLTRRU-0e0' \
+  -H 'Referer: https://10.20.129.197/ftthPortal/' \
+  -H 'Sec-Fetch-Dest: empty' \
+  -H 'Sec-Fetch-Mode: cors' \
+  -H 'Sec-Fetch-Site: same-origin' \
+  -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36' \
+  -H 'sec-ch-ua: "Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"' \
+  -H 'sec-ch-ua-mobile: ?0' \
+  -H 'sec-ch-ua-platform: "Windows"' \
+  --insecure
+
+{'timestamp': '2026-10-20T09:17:10.772+00:00', 'status': 401, 'error': 'Unauthorized', 'message': '', 'path': '/ftthPortalBE/dataSearchAndViewServiceNumberData/searchingWOAndVC4'}
+
+curl bash of refresh 
+curl --url 'https://10.20.129.197/ftthPortalBE/refresh' \
+  -H 'Accept: application/json, text/plain, */*' \
+  -H 'Accept-Language: en-US,en;q=0.9' \
+  -H 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJtb2hhbWVkLmF6YWJAb3JhbmdlLmNvbSIsIlJvbGVzIjoiW09yYW5nZSBGVFRILVhEU0wgTWl4ZWQgUm9sZSBNb25pdG9yXSIsImV4cCI6MTc5MjQ4ODM3OCwiaWF0IjoxNzkyNDg3Mjk4fQ.OgV_Yw-YTqJr2ngjogWH3cYw3Ck5fFSUqRAJ2TeQBaO35dZ638xKh3sokmLjpKII8dT1a0hMS5lpDcXcBeBkVQ' \
+  -H 'Connection: keep-alive' \
+  -b 'JSESSIONID=CF142789A987460B06445334DE1A1084; TS014d031a=010aa23b1d3dd1e366b0ca9c3db94c4f142fed1937403f22e2d32b167b423d3bbf6e078e9c30c8869adf25acaee017c29abe366f36eab3c305f8a9e0c64533356b6e917864a73343bf1d192c3b36193c9ba7ffb61972b759ee6be09b1a696c9ade94d57582; dtCookie=v_4_srv_52_sn_26BB0306B6A6232EDB12FFF276F4DBDC_perc_100000_ol_0_mul_1_app-3Aea7c4b59f27d43eb_1; BIGipServerFTTH_Portal_extenal_FE_Pool_443=3280016394.47873.0000; rxVisitor=1792479617070T828IICTOH2G2EMCPRB0L1IGLBKIR1OO; dtSa=-; dtPC=52$283337552_200h-vHIMNLDQGAKGNKUKSOSHEPIAFRJPAEWPA-0e0; rxvt=1792488738002|1792486938002; TS0155b883=010aa23b1d3c03647b6078076d530dc887f831c60cc94bceb679e8e08174231bafa5ea9ef1d1c2378eeefad358d1c78faf20d000921b648d52ee94e4a4256d4b46ef37ad1c8472ecc7b22dd36a8670f3948dd07957' \
+  -H 'Referer: https://10.20.129.197/ftthPortal/' \
+  -H 'Sec-Fetch-Dest: empty' \
+  -H 'Sec-Fetch-Mode: cors' \
+  -H 'Sec-Fetch-Site: same-origin' \
+  -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36' \
+  -H 'sec-ch-ua: "Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"' \
+  -H 'sec-ch-ua-mobile: ?0' \
+  -H 'sec-ch-ua-platform: "Windows"' \
+  --insecure
