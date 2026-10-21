@@ -2,17 +2,17 @@ import requests
 import json
 import re
 import base64
-import tkinter as tk
-from tkinter import filedialog
 import os
 import pandas as pd
 import time
 import sys
-from datetime import datetime
-from openpyxl import load_workbook
-import multiprocessing as mp
+import threading
 import random
 import urllib3
+from datetime import datetime
+from openpyxl import load_workbook
+
+KA_LOCK = threading.Lock()   # protects Authorization header updates / request races
 urllib3.disable_warnings()
 
 BASE    = "https://10.20.129.197/ftthPortalBE"
@@ -22,6 +22,8 @@ REFRESH = BASE + "/refresh"
 PREFIXES = {"2", "3", "13", "40", "48", "55", "62", "64", "46", "66", "68", "69",
             "50", "45", "57", "47", "92", "65", "84", "82", "86", "88", "93", "95", "96", "97"}
 
+KA_INTERVAL = 75          # keepalive refresh every 75s (backend re-issues ~every 2 min)
+
 # ------------------------------------------------------------------ parse pasted cURL
 def parse_curl(paste: str):
     """Extracts (bearer, cookie_dict) from a full 'Copy as cURL' paste, or a bare token."""
@@ -30,7 +32,7 @@ def parse_curl(paste: str):
     if m:
         bearer = m.group(1)
     elif re.fullmatch(r"[A-Za-z0-9\-_.]{80,}", paste) and paste.count(".") == 2:
-        bearer = paste                      # user pasted just the token
+        bearer = paste
     else:
         raise ValueError("لم يتم العثور على التوكن — الصق الـ curl كاملاً أو التوكن فقط")
 
@@ -46,7 +48,6 @@ def parse_curl(paste: str):
     return bearer, cookies
 
 def build_session(bearer, cookies):
-    """Create a session ONCE for the whole run (cookies + Set-Cookie rotation handled automatically)."""
     s = requests.Session()
     s.verify = False
     for k, v in cookies.items():
@@ -60,9 +61,8 @@ def build_session(bearer, cookies):
     })
     return s
 
-# ------------------------------------------------------------------ token refresh
+# ------------------------------------------------------------------ token handling
 def jwt_exp(token: str):
-    """Return 'exp' timestamp from the JWT payload (no verification)."""
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
@@ -72,10 +72,9 @@ def jwt_exp(token: str):
 
 def refresh_token(session, log_queue=None):
     """
-    Call /refresh with the current session (current bearer + cookies).
-    Extract new token from response JSON key 'result' ("Bearer eyJ..."),
-    update the session Authorization header IN PLACE.
-    Returns new token string. Raises PermissionError if refresh fails.
+    Call /refresh with the current session; extract new token from JSON key 'result'
+    ("Bearer eyJ...") and update the session Authorization header IN PLACE.
+    Raises PermissionError on failure.
     """
     r = session.get(REFRESH, timeout=20)
     if r.status_code != 200:
@@ -102,8 +101,8 @@ def split_number(full_number):
             return "0" + prefix, full_number[len(prefix):]
     return "", full_number
 
-# ------------------------------------------------------------------ excel writer
-def excel_writer_listener(queue, log_queue, results_file, draft_file):
+# ------------------------------------------------------------------ excel writer (thread inside worker)
+def excel_writer_loop(queue, log_queue, results_file, draft_file):
     headers = ["FULLNUMBER", "INFORMATION"]
     for f in [results_file, draft_file]:
         if not os.path.exists(f):
@@ -122,15 +121,6 @@ def excel_writer_listener(queue, log_queue, results_file, draft_file):
             wb.save(f)
         log_queue.put(f"تم معالجة السطر {line_number + 1}")
 
-def choose_excel_file():
-    root = tk.Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename(
-        title="Select Excel File",
-        filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")])
-    root.destroy()
-    return file_path if file_path else None
-
 def init_results_file(original_file_path):
     dir_name = os.path.dirname(original_file_path)
     base_name = os.path.splitext(os.path.basename(original_file_path))[0]
@@ -140,17 +130,22 @@ def init_results_file(original_file_path):
     pd.DataFrame(columns=["FULLNUMBER", "INFORMATION"]).to_excel(draft_file, index=False)
     return results_file, draft_file
 
-def get_base_dir():
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+# ------------------------------------------------------------------ keepalive
+def keepalive_loop(session, stop_event, log_queue):
+    """Refresh the token every KA_INTERVAL seconds so the session never dies, even idle."""
+    counter = 0
+    while not stop_event.wait(KA_INTERVAL):
+        try:
+            with KA_LOCK:
+                refresh_token(session)
+            counter += 1
+            if counter % 10 == 0:
+                log_queue.put("الجلسة ما زالت نشطة (keepalive)")
+        except Exception as e:
+            log_queue.put(f"فشل keepalive: {e}")
 
-BASE_DIR = get_base_dir()
-
-# ------------------------------------------------------------------ worker
-def worker_task(session, index, row_data, queue, stop_flag, log_queue):
-    if stop_flag.is_set():
-        return
+# ------------------------------------------------------------------ process one row
+def process_row(session, row_data, index, log_queue, batch_stop):
     full_number = str(row_data[0])
     full_number = full_number if full_number.startswith("0") else "0" + full_number
     landline_code, landline_number = split_number(str(row_data[0]))
@@ -158,120 +153,148 @@ def worker_task(session, index, row_data, queue, stop_flag, log_queue):
     time.sleep(random.uniform(0.1, 0.9))
 
     r = None
-    data = None
-
-    # ---- attempt loop: 1st try, and one retry after refresh if 401/403 ----
     for attempt in range(2):
-        if stop_flag.is_set():
-            return
+        if batch_stop.is_set():
+            return None
         try:
-            r = session.get(SEARCH, params={"cityCode": landline_code,
-                                            "serviceNumber": landline_number}, timeout=20)
+            with KA_LOCK:
+                r = session.get(SEARCH, params={"cityCode": landline_code,
+                                                "serviceNumber": landline_number}, timeout=20)
         except requests.RequestException as e:
-            queue.put((index, [full_number, f"error: {e}"]))
-            return
+            return (index, [full_number, f"error: {e}"])
 
         if r.status_code in (401, 403) or "اسم المستخدم" in r.text:
             if attempt == 0:
-                # token expired -> refresh and retry THIS SAME number once
                 try:
-                    refresh_token(session, log_queue)
-                    continue          # retry the same request with the new token
+                    with KA_LOCK:
+                        refresh_token(session, log_queue)
+                    continue                  # retry the SAME number with the new token
                 except (PermissionError, requests.RequestException) as e:
                     log_queue.put(f"فشل تجديد الجلسة: {e}")
-                    break             # fall through to the "session dead" handling below
-            break                     # second 401 in a row -> session really dead
+                    break
+            break
+        break
 
-        break                         # got a usable response (any status != 401/403)
-
-    # ---- session dead -> notify and stop the whole run ----
     if r is not None and (r.status_code in (401, 403) or "اسم المستخدم" in r.text):
         log_queue.put(f"انتهت الجلسة نهائياً عند السطر {index+1}")
         log_queue.put(f"برجاء بدء العملية مرة اخرى بداية من السطر {index+1}")
-        stop_flag.set()
-        return
+        return "SESSION_DEAD"
 
     if r.status_code != 200:
-        queue.put((index, [full_number, f"error HTTP {r.status_code}: {r.text[:100]}"]))
-        return
+        return (index, [full_number, f"error HTTP {r.status_code}: {r.text[:100]}"])
 
     try:
         data = r.json()
     except ValueError:
-        queue.put((index, [full_number, f"error: غير JSON — {r.text[:100]}"]))
-        return
+        return (index, [full_number, f"error: غير JSON — {r.text[:100]}"])
 
     if data.get("code") == 1:
-        queue.put((index, [full_number, "Orange"]))
+        return (index, [full_number, "Orange"])
     elif data.get("code") == 4:
         msg = data.get("errorMessage") or ""
         if "Not Accepted" in msg:
-            queue.put((index, [full_number, "Free"]))
+            return (index, [full_number, "Free"])
         elif "another ISP" in msg:
-            queue.put((index, [full_number, "Another Isp"]))
+            return (index, [full_number, "Another Isp"])
         else:
-            queue.put((index, [full_number, f"code4: {msg}"]))
+            return (index, [full_number, f"code4: {msg}"])
     else:
-        queue.put((index, [full_number, f"unknown code {data.get('code')}"]))
+        return (index, [full_number, f"unknown code {data.get('code')}"])
 
-# ------------------------------------------------------------------ runner
-def run_bot(curl_paste, start_line, excel_file, log_queue, stop_flag):
-    try:
-        results_file, draft_file = init_results_file(excel_file)
+# ------------------------------------------------------------------ persistent worker process
+def session_worker(cmd_queue, log_queue, batch_stop, kill_event):
+    """
+    Lives for the whole app lifetime. Holds the session + keepalive forever.
+    Commands: ("RUN", curl_paste, excel_file, start_line) | ("QUIT",)
+    batch_stop: aborts current batch but keeps session. kill_event: stops keepalive.
+    """
+    session = None                        # <- RESTORED
 
-        try:
-            df = pd.read_excel(excel_file, header=None)
-        except Exception as e:
-            log_queue.put(f"Could not read Excel file: {e}")
-            log_queue.put("تم انهاء العملية")
-            stop_flag.set()
-            return
+    while True:
+        cmd = cmd_queue.get()
+        if cmd is None or cmd[0] == "QUIT":
+            break
+        if cmd[0] == "RUN":
+            _, curl_paste, excel_file, start_line = cmd
+            try:
+                if session is None:
+                    bearer, cookies = parse_curl(curl_paste)
+                    session = build_session(bearer, cookies)
+                    with KA_LOCK:         # <- was session.ka_lock
+                        refresh_token(session, log_queue)
+                    threading.Thread(target=keepalive_loop,
+                                     args=(session, kill_event, log_queue),
+                                     daemon=True).start()
+                    log_queue.put("تم تجهيز الجلسة — keepalive نشط")
+                else:
+                    # user may paste a fresh curl after a hard logout — update creds
+                    try:
+                        bearer, cookies = parse_curl(curl_paste)
+                        with KA_LOCK:     # <- was session.ka_lock
+                            session.headers["Authorization"] = "Bearer " + bearer
+                            for k, v in cookies.items():
+                                session.cookies.set(k, v)
+                            refresh_token(session, log_queue)
+                    except Exception as e:
+                        log_queue.put(f"تحذير: تعذر تحديث بيانات الدخول ({e}) — سيتم استخدام الجلسة الحالية")
 
-        try:
-            bearer, cookies = parse_curl(curl_paste)
-        except ValueError as e:
-            log_queue.put(str(e))
-            log_queue.put("تم انهاء العملية")
-            stop_flag.set()
-            return
+                batch_stop.clear()
+                results_file, draft_file = init_results_file(excel_file)
+                try:
+                    df = pd.read_excel(excel_file, header=None)
+                except Exception as e:
+                    log_queue.put(f"Could not read Excel file: {e}")
+                    log_queue.put("تم انهاء العملية")
+                    log_queue.put("__BATCH_DONE__")
+                    continue
 
-        session = build_session(bearer, cookies)
+                start_index = int(start_line) - 1
+                tasks = [(index, list(row)) for index, row in df.iloc[start_index:].iterrows()]
+                if not tasks:
+                    log_queue.put("لا توجد بيانات لمعالجتها")
+                    log_queue.put("تم انهاء العملية")
+                    log_queue.put("__BATCH_DONE__")
+                    continue
 
-        # sanity check before starting: try one refresh now (also confirms /refresh works)
-        try:
-            refresh_token(session, log_queue)
-        except Exception as e:
-            log_queue.put(f"فشل تجديد الجلسة عند البداية: {e} — تأكد من صحة الـ curl")
-            log_queue.put("تم انهاء العملية")
-            stop_flag.set()
-            return
+                log_queue.put(f"بدء المعالجة من السطر {start_index+1} — عدد الصفوف {len(tasks)}")
+                start_time = time.time()
+                aborted = False
 
-        log_queue.put("تم تجهيز الجلسة — جاري معالجة البيانات")
+                import queue as pyqueue
+                writer_q = pyqueue.Queue()
+                wt = threading.Thread(target=excel_writer_loop,
+                                      args=(writer_q, log_queue, results_file, draft_file),
+                                      daemon=True)
+                wt.start()
 
-        start_time = time.time()
-        start_index = int(start_line) - 1
-        tasks = [(index, list(row)) for index, row in df.iloc[start_index:].iterrows()]
+                session_dead = False
+                for index, row_data in tasks:
+                    if batch_stop.is_set():
+                        log_queue.put("تم ايقاف العملية بواسطة المستخدم")
+                        aborted = True
+                        break
+                    result = process_row(session, row_data, index, log_queue, batch_stop)
+                    if result == "SESSION_DEAD":
+                        session_dead = True
+                        break
+                    if result is not None:
+                        writer_q.put(result)
 
-        with mp.Manager() as internal_manager:
-            results_queue = internal_manager.Queue()
-            watcher = mp.Process(target=excel_writer_listener,
-                                 args=(results_queue, log_queue, results_file, draft_file))
-            watcher.start()
+                writer_q.put("STOP")
+                wt.join(timeout=30)
 
-            with mp.Pool(1) as pool:
-                pool.starmap(worker_task, [
-                    (session, t[0], t[1], results_queue, stop_flag, log_queue)
-                    for t in tasks
-                ])
+                if not aborted and not session_dead:
+                    log_queue.put("تم انهاء العملية")
+                    elapsed = (time.time() - start_time) / 60
+                    log_queue.put(f"وقت المعالجة {elapsed:.2f} دقيقة")
+                log_queue.put("__BATCH_DONE__")     # UI uses this to re-enable inputs
+                # session stays alive regardless — keepalive keeps running
 
-            results_queue.put("STOP")
-            watcher.join()
+            except Exception as e:
+                log_queue.put("خطأ اثناء اجراء العملية")
+                log_queue.put(f"{e}")
+                log_queue.put("__BATCH_DONE__")
 
-        log_queue.put("تم انهاء العملية")
-        elapsed = (time.time() - start_time) / 60
-        log_queue.put(f"وقت المعالجة {elapsed:.2f} دقيقة")
-        stop_flag.set()
-    except Exception as e:
-        log_queue.put("خطأ اثناء اجراء العملية")
-        log_queue.put(f"{e}")
-        stop_flag.set()
+    # QUIT: stop keepalive and exit
+    kill_event.set()
+    log_queue.put("تم ايقاف الـ worker")
