@@ -73,7 +73,7 @@ def jwt_exp(token: str):
 def refresh_token(session, log_queue=None):
     """
     Call /refresh with the current session (current bearer + cookies).
-    Extract new token from response JSON key 'value' ("Bearer eyJ..."),
+    Extract new token from response JSON key 'result' ("Bearer eyJ..."),
     update the session Authorization header IN PLACE.
     Returns new token string. Raises PermissionError if refresh fails.
     """
@@ -81,7 +81,7 @@ def refresh_token(session, log_queue=None):
     if r.status_code != 200:
         raise PermissionError(f"refresh failed: HTTP {r.status_code}")
     try:
-        new_token = r.json().get("value", "")
+        new_token = r.json().get("result", "")
     except ValueError:
         raise PermissionError("refresh response was not JSON")
     if new_token.lower().startswith("bearer "):
