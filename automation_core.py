@@ -228,15 +228,22 @@ def session_worker(cmd_queue, log_queue, batch_stop, kill_event):
                     log_queue.put("تم تجهيز الجلسة — keepalive نشط")
                 else:
                     # user may paste a fresh curl after a hard logout — update creds
+                    # user pasted something new — try to apply it WITHOUT destroying the live session if it's invalid
+                    old_auth = None
+                    with KA_LOCK:
+                        old_auth = session.headers.get("Authorization")
                     try:
                         bearer, cookies = parse_curl(curl_paste)
-                        with KA_LOCK:     # <- was session.ka_lock
+                        with KA_LOCK:
                             session.headers["Authorization"] = "Bearer " + bearer
                             for k, v in cookies.items():
                                 session.cookies.set(k, v)
-                            refresh_token(session, log_queue)
+                            refresh_token(session, log_queue)   # must succeed
+                        log_queue.put("تم تحديث بيانات الدخول بنجاح")
                     except Exception as e:
-                        log_queue.put(f"تحذير: تعذر تحديث بيانات الدخول ({e}) — سيتم استخدام الجلسة الحالية")
+                        with KA_LOCK:
+                            session.headers["Authorization"] = old_auth   # restore live token
+                        log_queue.put(f"تحذير: تعذر تحديث بيانات الدخول ({e}) — تم الرجوع للجلسة الحالية")
 
                 batch_stop.clear()
                 results_file, draft_file = init_results_file(excel_file)
