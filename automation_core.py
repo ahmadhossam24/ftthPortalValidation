@@ -12,54 +12,116 @@ import urllib3
 from datetime import datetime
 from openpyxl import load_workbook
 
-KA_LOCK = threading.Lock()   # protects Authorization header updates / request races
+KA_LOCK = threading.Lock()
 urllib3.disable_warnings()
 
 BASE    = "https://10.20.129.197/ftthPortalBE"
+PORTAL  = "https://10.20.129.197/ftthPortal/"
+CAPTCHA = BASE + "/captcha"
+SIGNIN  = BASE + "/signin"
+AUTHOTP = BASE + "/authotp"
 SEARCH  = BASE + "/dataSearchAndViewServiceNumberData/searchingWOAndVC4"
 REFRESH = BASE + "/refresh"
 
 PREFIXES = {"2", "3", "13", "40", "48", "55", "62", "64", "46", "66", "68", "69",
             "50", "45", "57", "47", "92", "65", "84", "82", "86", "88", "93", "95", "96", "97"}
 
-KA_INTERVAL = 75          # keepalive refresh every 75s (backend re-issues ~every 2 min)
+KA_INTERVAL = 75
 
-# ------------------------------------------------------------------ parse pasted cURL
-def parse_curl(paste: str):
-    """Extracts (bearer, cookie_dict) from a full 'Copy as cURL' paste, or a bare token."""
-    paste = paste.strip()
-    m = re.search(r"Bearer\s+([A-Za-z0-9\-_.]+)", paste)
-    if m:
-        bearer = m.group(1)
-    elif re.fullmatch(r"[A-Za-z0-9\-_.]{80,}", paste) and paste.count(".") == 2:
-        bearer = paste
-    else:
-        raise ValueError("لم يتم العثور على التوكن — الصق الـ curl كاملاً أو التوكن فقط")
-
-    cookies = {}
-    m = re.search(r"-b\s+'([^']*)'", paste)
-    if not m:
-        m = re.search(r'-b\s+"([^"]*)"', paste)
-    if m:
-        for part in m.group(1).split(";"):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                cookies[k.strip()] = v.strip()
-    return bearer, cookies
-
-def build_session(bearer, cookies):
+# ------------------------------------------------------------------ session builders
+def new_session():
     s = requests.Session()
     s.verify = False
-    for k, v in cookies.items():
-        s.cookies.set(k, v)
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Referer": "https://10.20.129.197/ftthPortal/",
-        "Authorization": "Bearer " + bearer,
+        "Referer": PORTAL,
     })
     return s
+
+def build_session(bearer, cookies):
+    s = new_session()
+    for k, v in cookies.items():
+        s.cookies.set(k, v)
+    s.headers["Authorization"] = "Bearer " + bearer
+    return s
+
+# ------------------------------------------------------------------ login flow (runs in worker)
+def login_flow(session, log_queue, cmd_queue, batch_stop):
+    """
+    Interactive login driven by the worker session.
+    Exchanges messages with the UI via cmd_queue (UI -> worker) and log_queue
+    sentinels (worker -> UI). Returns True when fully logged in, False if aborted.
+    """
+    # step 1: portal page -> JSESSIONID / F5 cookies
+    session.get(PORTAL, timeout=20)
+
+    # step 2: captcha
+    r = session.get(CAPTCHA, timeout=20)
+    captcha_b64 = r.json().get("result", "")
+    if not captcha_b64:
+        log_queue.put("__LOGIN_FAILED__|لم يتم تحميل الكابتشا")
+        return False
+    log_queue.put("__SHOW_LOGIN__|" + captcha_b64)
+
+    # step 3: wait for credentials from UI
+    while True:
+        if batch_stop.wait(0.2):
+            log_queue.put("__LOGIN_FAILED__|تم الالغاء")
+            return False
+        try:
+            cmd = cmd_queue.get(timeout=0.1)
+        except Exception:
+            continue
+        if cmd and cmd[0] == "LOGIN_SUBMIT":
+            _, username, password, captcha_code = cmd
+            break
+
+    # step 4: signin
+    r = session.post(SIGNIN, timeout=20,
+                     json={"username": username, "password": password,
+                           "captchaCode": captcha_code})
+    try:
+        data = r.json()
+    except ValueError:
+        log_queue.put("__LOGIN_FAILED__|رد غير متوقع من تسجيل الدخول")
+        return False
+    if not data.get("success") or not data.get("token"):
+        msg = data.get("errorMessage") or f"HTTP {r.status_code}"
+        log_queue.put("__LOGIN_FAILED__|" + msg)
+        return False
+
+    token = data["token"].replace("Bearer ", "", 1)
+    session.headers["Authorization"] = "Bearer " + token
+    log_queue.put("تم التحقق من بيانات الدخول")
+
+    # step 5: OTP
+    log_queue.put("__NEED_OTP__")
+    while True:
+        if batch_stop.wait(0.2):
+            return False
+        try:
+            cmd = cmd_queue.get(timeout=0.1)
+        except Exception:
+            continue
+        if cmd and cmd[0] == "LOGIN_OTP":
+            _, otp = cmd
+            break
+
+    r = session.post(AUTHOTP, timeout=20, json={"otp": otp})
+    try:
+        data = r.json()
+    except ValueError:
+        log_queue.put("__LOGIN_FAILED__|رد غير متوقع من OTP")
+        return False
+    if r.status_code != 200 or not (data.get("sucess") or data.get("success")):
+        msg = data.get("messages") or data.get("errorMessage") or f"HTTP {r.status_code}"
+        log_queue.put("__LOGIN_FAILED__|OTP: " + str(msg))
+        return False
+
+    log_queue.put("__LOGGED_IN__")
+    return True
 
 # ------------------------------------------------------------------ token handling
 def jwt_exp(token: str):
@@ -71,11 +133,6 @@ def jwt_exp(token: str):
         return None
 
 def refresh_token(session, log_queue=None):
-    """
-    Call /refresh with the current session; extract new token from JSON key 'result'
-    ("Bearer eyJ...") and update the session Authorization header IN PLACE.
-    Raises PermissionError on failure.
-    """
     r = session.get(REFRESH, timeout=20)
     if r.status_code != 200:
         raise PermissionError(f"refresh failed: HTTP {r.status_code}")
@@ -101,7 +158,7 @@ def split_number(full_number):
             return "0" + prefix, full_number[len(prefix):]
     return "", full_number
 
-# ------------------------------------------------------------------ excel writer (thread inside worker)
+# ------------------------------------------------------------------ excel writer
 def excel_writer_loop(queue, log_queue, results_file, draft_file):
     headers = ["FULLNUMBER", "INFORMATION"]
     for f in [results_file, draft_file]:
@@ -112,7 +169,7 @@ def excel_writer_loop(queue, log_queue, results_file, draft_file):
         if item == "STOP":
             break
         line_number, record = item
-        target_row = line_number + 2          # header row + Excel 1-based
+        target_row = line_number + 2
         for f in [results_file, draft_file]:
             wb = load_workbook(f)
             sheet = wb.active
@@ -132,7 +189,6 @@ def init_results_file(original_file_path):
 
 # ------------------------------------------------------------------ keepalive
 def keepalive_loop(session, stop_event, log_queue):
-    """Refresh the token every KA_INTERVAL seconds so the session never dies, even idle."""
     counter = 0
     while not stop_event.wait(KA_INTERVAL):
         try:
@@ -153,8 +209,6 @@ def process_row(session, row_data, index, log_queue, batch_stop):
     time.sleep(random.uniform(0.1, 0.9))
 
     r = None
-
-    # ---- connection-level retry loop (proxy/VPN hiccups): same line, wait & retry ----
     conn_failures = 0
     while True:
         if batch_stop.is_set():
@@ -163,7 +217,7 @@ def process_row(session, row_data, index, log_queue, batch_stop):
             with KA_LOCK:
                 r = session.get(SEARCH, params={"cityCode": landline_code,
                                                 "serviceNumber": landline_number}, timeout=20)
-            break                     # got a response (any status) -> move to auth handling
+            break
         except requests.RequestException as e:
             conn_failures += 1
             msg = str(e)
@@ -172,17 +226,13 @@ def process_row(session, row_data, index, log_queue, batch_stop):
                 log_queue.put(("بروكسي/شبكة: توقف مؤقت — جاري الانتظار والمحاولة مجدداً"
                                if is_proxy else
                                f"خطأ شبكة: توقف مؤقت — جاري الانتظار ({e.__class__.__name__})"))
-            if conn_failures >= 12:   # ~10+ min of waiting -> give up on this batch
+            if conn_failures >= 12:
                 log_queue.put("انقطاع طويل في الشبكة/البروكسي — ايقاف الدفعة، الجلسة ستبقى قيد التجديد")
                 return (index, [full_number, "error: network/proxy down (batch aborted)"])
-            # backoff: 15s, 30s, 45s ... capped at 60s
             wait = min(15 * conn_failures, 60)
-            if batch_stop.wait(wait):     # interruptible sleep — Stop works instantly
+            if batch_stop.wait(wait):
                 return None
-            # loop -> retry the SAME line
-    # ---- end connection retry loop ----
 
-    # ---- auth handling: 401/403 -> one refresh + retry (unchanged logic) ----
     for attempt in range(2):
         if r.status_code in (401, 403) or "اسم المستخدم" in r.text:
             if attempt == 0:
@@ -229,50 +279,47 @@ def process_row(session, row_data, index, log_queue, batch_stop):
     else:
         return (index, [full_number, f"unknown code {data.get('code')}"])
 
-# ------------------------------------------------------------------ persistent worker process
+# ------------------------------------------------------------------ persistent worker
 def session_worker(cmd_queue, log_queue, batch_stop, kill_event):
     """
-    Lives for the whole app lifetime. Holds the session + keepalive forever.
-    Commands: ("RUN", curl_paste, excel_file, start_line) | ("QUIT",)
-    batch_stop: aborts current batch but keeps session. kill_event: stops keepalive.
+    Lives for the whole app lifetime. Holds session + keepalive forever.
+    Commands: ("LOGIN",) | ("LOGIN_SUBMIT", user, pass, captcha) | ("LOGIN_OTP", otp)
+              | ("RUN", excel_file, start_line) | ("QUIT",)
     """
-    session = None                        # <- RESTORED
+    session = None
 
     while True:
         cmd = cmd_queue.get()
         if cmd is None or cmd[0] == "QUIT":
             break
-        if cmd[0] == "RUN":
-            _, curl_paste, excel_file, start_line = cmd
+
+        # ---- login ----
+        if cmd[0] == "LOGIN":
+            if session is None:
+                session = new_session()
             try:
-                if session is None:
-                    bearer, cookies = parse_curl(curl_paste)
-                    session = build_session(bearer, cookies)
-                    with KA_LOCK:         # <- was session.ka_lock
-                        refresh_token(session, log_queue)
+                ok = login_flow(session, log_queue, cmd_queue, batch_stop)
+                if ok:
+                    with KA_LOCK:
+                        refresh_token(session, log_queue)   # validate + chain the token
                     threading.Thread(target=keepalive_loop,
                                      args=(session, kill_event, log_queue),
                                      daemon=True).start()
                     log_queue.put("تم تجهيز الجلسة — keepalive نشط")
                 else:
-                    # user may paste a fresh curl after a hard logout — update creds
-                    # user pasted something new — try to apply it WITHOUT destroying the live session if it's invalid
-                    old_auth = None
-                    with KA_LOCK:
-                        old_auth = session.headers.get("Authorization")
-                    try:
-                        bearer, cookies = parse_curl(curl_paste)
-                        with KA_LOCK:
-                            session.headers["Authorization"] = "Bearer " + bearer
-                            for k, v in cookies.items():
-                                session.cookies.set(k, v)
-                            refresh_token(session, log_queue)   # must succeed
-                        log_queue.put("تم تحديث بيانات الدخول بنجاح")
-                    except Exception as e:
-                        with KA_LOCK:
-                            session.headers["Authorization"] = old_auth   # restore live token
-                        log_queue.put(f"تحذير: تعذر تحديث بيانات الدخول ({e}) — تم الرجوع للجلسة الحالية")
+                    log_queue.put("لم يتم اكمال تسجيل الدخول")
+            except Exception as e:
+                log_queue.put(f"خطأ في تسجيل الدخول: {e}")
+            continue
 
+        # ---- run batch ----
+        if cmd[0] == "RUN":
+            _, excel_file, start_line = cmd
+            if session is None:
+                log_queue.put("لا توجد جلسة — سجل الدخول أولاً")
+                log_queue.put("__BATCH_DONE__")
+                continue
+            try:
                 batch_stop.clear()
                 results_file, draft_file = init_results_file(excel_file)
                 try:
@@ -322,14 +369,13 @@ def session_worker(cmd_queue, log_queue, batch_stop, kill_event):
                     log_queue.put("تم انهاء العملية")
                     elapsed = (time.time() - start_time) / 60
                     log_queue.put(f"وقت المعالجة {elapsed:.2f} دقيقة")
-                log_queue.put("__BATCH_DONE__")     # UI uses this to re-enable inputs
-                # session stays alive regardless — keepalive keeps running
+                log_queue.put("__BATCH_DONE__")
 
             except Exception as e:
                 log_queue.put("خطأ اثناء اجراء العملية")
                 log_queue.put(f"{e}")
                 log_queue.put("__BATCH_DONE__")
+            continue
 
-    # QUIT: stop keepalive and exit
     kill_event.set()
     log_queue.put("تم ايقاف الـ worker")
