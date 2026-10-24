@@ -153,29 +153,57 @@ def process_row(session, row_data, index, log_queue, batch_stop):
     time.sleep(random.uniform(0.1, 0.9))
 
     r = None
-    for attempt in range(2):
+
+    # ---- connection-level retry loop (proxy/VPN hiccups): same line, wait & retry ----
+    conn_failures = 0
+    while True:
         if batch_stop.is_set():
             return None
         try:
             with KA_LOCK:
                 r = session.get(SEARCH, params={"cityCode": landline_code,
                                                 "serviceNumber": landline_number}, timeout=20)
+            break                     # got a response (any status) -> move to auth handling
         except requests.RequestException as e:
-            return (index, [full_number, f"error: {e}"])
+            conn_failures += 1
+            msg = str(e)
+            is_proxy = ("ProxyError" in msg) or ("407" in msg) or ("Tunnel" in msg)
+            if conn_failures == 1:
+                log_queue.put(("بروكسي/شبكة: توقف مؤقت — جاري الانتظار والمحاولة مجدداً"
+                               if is_proxy else
+                               f"خطأ شبكة: توقف مؤقت — جاري الانتظار ({e.__class__.__name__})"))
+            if conn_failures >= 12:   # ~10+ min of waiting -> give up on this batch
+                log_queue.put("انقطاع طويل في الشبكة/البروكسي — ايقاف الدفعة، الجلسة ستبقى قيد التجديد")
+                return (index, [full_number, "error: network/proxy down (batch aborted)"])
+            # backoff: 15s, 30s, 45s ... capped at 60s
+            wait = min(15 * conn_failures, 60)
+            if batch_stop.wait(wait):     # interruptible sleep — Stop works instantly
+                return None
+            # loop -> retry the SAME line
+    # ---- end connection retry loop ----
 
+    # ---- auth handling: 401/403 -> one refresh + retry (unchanged logic) ----
+    for attempt in range(2):
         if r.status_code in (401, 403) or "اسم المستخدم" in r.text:
             if attempt == 0:
                 try:
                     with KA_LOCK:
                         refresh_token(session, log_queue)
-                    continue                  # retry the SAME number with the new token
+                    try:
+                        with KA_LOCK:
+                            r = session.get(SEARCH, params={"cityCode": landline_code,
+                                                            "serviceNumber": landline_number},
+                                            timeout=20)
+                    except requests.RequestException as e:
+                        return (index, [full_number, f"error: {e}"])
+                    continue
                 except (PermissionError, requests.RequestException) as e:
                     log_queue.put(f"فشل تجديد الجلسة: {e}")
                     break
             break
         break
 
-    if r is not None and (r.status_code in (401, 403) or "اسم المستخدم" in r.text):
+    if r.status_code in (401, 403) or "اسم المستخدم" in r.text:
         log_queue.put(f"انتهت الجلسة نهائياً عند السطر {index+1}")
         log_queue.put(f"برجاء بدء العملية مرة اخرى بداية من السطر {index+1}")
         return "SESSION_DEAD"
