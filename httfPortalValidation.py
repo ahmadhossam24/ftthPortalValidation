@@ -2,8 +2,38 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from multiprocessing import freeze_support, Manager, Process
 import base64
+import json
+import os
+import sys
 
 import automation_core
+
+# ---- frozen-aware base dir (works as .py and as PyInstaller --onedir exe) ----
+def get_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)     # exe folder (--onedir)
+    return os.path.dirname(os.path.abspath(__file__))
+
+CREDENTIALS_FILE = os.path.join(get_base_dir(), "credentials.json")
+
+def load_credentials():
+    """Returns {'username': ..., 'password': ...} or {} if missing/empty/corrupt."""
+    try:
+        with open(CREDENTIALS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("username") and data.get("password"):
+            return {"username": data["username"], "password": data["password"]}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {}          # first run / empty file / corrupt file -> silently empty
+
+def save_credentials(username, password):
+    try:
+        with open(CREDENTIALS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"username": username, "password": password},
+                      f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        log_text_widget.insert(tk.END, f"تعذر حفظ بيانات الدخول: {e}\n")
 
 if __name__ == '__main__':
     freeze_support()
@@ -20,6 +50,9 @@ if __name__ == '__main__':
     UPDATE_INTERVAL = 100
     root = tk.Tk()
     root.title("Automation Tool for httf portal Validation")
+    saved = load_credentials()          # {} on first run — no error
+    saved_username = saved.get("username", "")
+    saved_password = saved.get("password", "")
 
     def update_log_from_queue():
         while not log_queue.empty():
@@ -30,6 +63,8 @@ if __name__ == '__main__':
                 show_login_window(msg.split("|", 1)[1])
             elif msg == "__NEED_OTP__":
                 show_otp_window()
+                if pending_creds["username"]:
+                    save_credentials(pending_creds["username"], pending_creds["password"])
             elif msg == "__LOGGED_IN__":
                 close_login_windows()
                 login_button.config(state=tk.DISABLED)
@@ -46,19 +81,23 @@ if __name__ == '__main__':
 
     # ---------------- login windows ----------------
     login_win = {"win": None}
+    pending_creds = {"username": "", "password": ""}
 
     def show_login_window(captcha_b64):
         win = tk.Toplevel(root)
         win.title("تسجيل الدخول")
-        login_win["win"] = win
-
+        login_win["win"] = win  
+        
         tk.Label(win, text="Email:").grid(row=0, column=0, padx=5, pady=5)
         user_e = tk.Entry(win, width=35)
         user_e.grid(row=0, column=1, padx=5, pady=5)
 
         tk.Label(win, text="Password:").grid(row=1, column=0, padx=5, pady=5)
-        pass_e = tk.Entry(win, width=35, show="*")
+        pass_e = tk.Entry(win, width=35)
         pass_e.grid(row=1, column=1, padx=5, pady=5)
+
+        user_e.insert(0, saved_username)
+        pass_e.insert(0, saved_password)
 
         img = tk.PhotoImage(data=base64.b64decode(captcha_b64))
         tk.Label(win, image=img).grid(row=2, column=0, columnspan=2, pady=5)
@@ -73,6 +112,8 @@ if __name__ == '__main__':
             if not u or not p or not c:
                 messagebox.showerror("خطأ", "برجاء ادخال جميع البيانات", parent=win)
                 return
+            pending_creds["username"] = user_e.get().strip()
+            pending_creds["password"] = pass_e.get()
             cmd_queue.put(("LOGIN_SUBMIT", u, p, c))
             win.destroy()
 
@@ -111,6 +152,10 @@ if __name__ == '__main__':
         root.after(0, lambda: stop_button.config(state=tk.DISABLED))
 
     def on_closing():
+        if not messagebox.askyesno(
+                "تأكيد",
+                "هل انت متأكد؟ سوف يقوم بتسجيل الخروج من الموقع"):
+            return  
         cmd_queue.put(("QUIT",))
         kill_event.set()
         batch_stop.set()
